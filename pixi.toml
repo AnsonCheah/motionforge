@@ -1,0 +1,168 @@
+# pixi.toml — motionforge
+#
+# Two isolated environments in ONE reproducible workspace:
+#   - planner : ROS2 (RoboStack) + PyTorch (cu128) + cuRobo   [dev + runtime]
+#   - sim     : Isaac Sim 6.0                                          [validation twin]
+#
+# The two envs never share Python packages. They communicate over DDS on a shared
+# ROS_DOMAIN_ID, which is transport-level and env-agnostic. This is what lets Isaac
+# Sim's tight dependency pins live separately from the cu128 planner stack.
+# See INSTALL.md for the full walkthrough and the helper scripts referenced below.
+
+[workspace]
+name = "motionforge"
+version = "0.1.0"
+description = "GPU-accelerated motion planning pipeline for robotic manipulation"
+channels = ["conda-forge"]
+platforms = ["linux-64"]                  # cuRobo + Isaac are Linux-first
+
+# Gate every solve on a Blackwell-capable CUDA driver. sm_120 (RTX 50xx) needs 12.8+.
+[system-requirements]
+cuda = "12.8"
+# Isaac Sim ships manylinux_2_35 wheels. Without this, pixi assumes a conservative
+# default glibc for linux-64 (~2.28) and rejects them with "no matching platform tag".
+# Declaring the floor (host is 2.39) lets the 2.35-tagged wheels resolve.
+libc = { family = "glibc", version = "2.35" }
+
+# PyPI: Isaac Sim and its isaacsim-* sub-packages resolve from NVIDIA's index.
+# (torch is pinned to the PyTorch cu128 index per-package below.)
+[pypi-options]
+extra-index-urls = ["https://pypi.nvidia.com"]
+
+# Shared across every environment. NOTE: python is pinned PER-FEATURE (below), not here —
+# the planner and Isaac Sim both currently use 3.12, but keeping the pin per-feature
+# lets either env move independently if RoboStack/cuRobo or Isaac changes again.
+[dependencies]
+pip = "*"
+
+# Shared env vars. Same DDS domain so the planner node and Isaac discover each other.
+[activation.env]
+ROS_DOMAIN_ID = "42"
+RMW_IMPLEMENTATION = "rmw_fastrtps_cpp"
+
+# ---------------------------------------------------------------------------
+# planner feature : build toolchain + scientific libs + PyTorch (cu128)
+# ---------------------------------------------------------------------------
+# Auto-source the CUDA env on every planner activation, so CUDA_HOME / CPATH /
+# TORCH_CUDA_ARCH_LIST are always set (curobolib's runtime cuda.core JIT and any
+# from-source CUDA build need them). No need to source scripts/cuda_env.sh by hand —
+# `pixi run -e planner ...` and `pixi shell -e planner` both get it.
+[feature.planner.activation]
+scripts = ["scripts/cuda_env.sh"]
+
+[feature.planner.dependencies]
+python = "3.12.*"         # RoboStack Jazzy np2 builds target py312.
+# CUDA toolkit to COMPILE cuRobo. Its major.minor MUST match torch's cu128,
+# or you get a silent "no kernel image available" at runtime. The toolkit comes from
+# conda into the env, so no system CUDA install is needed (only the NVIDIA driver).
+cuda-version = "12.8.*"
+cuda-toolkit = "12.8.*"
+# CUDA 12.8's nvcc (and torch's build-time host-compiler check) require gcc < 14.
+# Unpinned gxx pulls 14.x, which fails the cuRobo/nvblox build with
+# "compiler version is greater than the maximum required by CUDA 12.8". Pin to 13.
+gxx = "13.*"
+cmake = ">=3.27"
+ninja = "*"
+git = "*"
+pkg-config = "*"
+numpy = ">=2,<3"          # force RoboStack's np2 variants and keep ROS + torch aligned
+scipy = "*"
+
+[feature.planner.pypi-dependencies]
+# Blackwell (sm_120) requires the cu128 wheels. Pin the index on the package itself.
+torch = { version = ">=2.7", index = "https://download.pytorch.org/whl/cu128" }
+torchvision = { version = ">=0.22", index = "https://download.pytorch.org/whl/cu128" }
+trimesh = "*"
+# curobov2 uses the modern top-level warp API (wp.device_from_torch), not the old
+# warp.torch shim (removed in warp 1.12) — so unlike v0.7.8 we track current warp.
+# Lock-managed here for reproducibility (cuRobo's own dep is just warp-lang>=0.10).
+warp-lang = ">=1.12"
+# curobov2's curobolib JIT-compiles its CUDA kernels at runtime via NVIDIA's cuda.core
+# (the new default backend; it ships no pre-compiled pybind extension). Without this:
+# "Error loading cuda.core backend: No module named 'cuda.core'".
+cuda-core = { version = "*", extras = ["cu12"] }
+# NOTE: cuRobo and nvblox_torch are deliberately NOT declared here. They compile from
+# source against the torch installed above (--no-build-isolation), so they are built
+# by the tasks below rather than resolved as wheels. See INSTALL.md.
+
+# ---------------------------------------------------------------------------
+# ros feature : ROS2 via RoboStack
+# Jazzy chosen to match Isaac Sim 6.0 on Ubuntu 24.04 (it auto-loads its internal
+# Jazzy libs there; Humble is only auto-loaded on 22.04). The match isn't strictly
+# required for DDS — comms key on message IDL, not the distro label — but matching
+# avoids Humble<->Jazzy type-hash edge cases. On a 22.04 host, switch this channel
+# and the ros-jazzy-* names back to robostack-humble / ros-humble-*.
+# ---------------------------------------------------------------------------
+[feature.ros]
+channels = ["https://prefix.dev/robostack-jazzy"]
+
+[feature.ros.dependencies]
+ros-jazzy-ros-base = "*"           # includes rclpy, tf2_ros, etc.
+ros-jazzy-rviz2 = "*"
+colcon-common-extensions = "*"
+
+# ---------------------------------------------------------------------------
+# sim feature : Isaac Sim 6.0 (own environment, no shared Python packages)
+# ---------------------------------------------------------------------------
+# Isaac Sim 6.0's deps span both indexes (mujoco-usd-converter on pypi.org, isaacsim-* on
+# pypi.nvidia.com). uv's default first-index strategy can't mix them. SCOPED TO SIM ONLY —
+# a global setting perturbs the validated planner env's resolution.
+[feature.sim.pypi-options]
+index-strategy = "unsafe-best-match"
+
+[feature.sim.dependencies]
+# Isaac Sim 6.0 requires Python 3.12. Pinned per-feature so either env can move independently.
+# 6.0 uses modern packaging/numpy, so the old packaging==23.0 pin is gone.
+python = "3.12.*"
+# isaacsim-core 6.0 pins torch==2.11.0, whose wheel requires setuptools<82; conda otherwise
+# installs 82.x and uv refuses to override it. Cap so the conda setuptools satisfies torch.
+setuptools = "<82"
+
+[feature.sim.pypi-dependencies]
+# 6.0 fixes the librtx.scenedb crash that 5.1 hit on Blackwell (RTX 50xx) + driver 595.
+# Exact pin avoids uv reading "6.0.*" as needing pre-release (dev) tags.
+isaacsim = { version = "==6.0.0.1", extras = ["all", "extscache"] }
+# isaacsim transitively needs this RC; uv only honors a pre-release if it's a DIRECT dep
+# with a pre-release specifier, so declare it here.
+tinyobjloader = "==2.0.0rc13"
+
+[feature.sim.activation.env]
+OMNI_KIT_ACCEPT_EULA = "YES"
+
+[feature.sim.tasks]
+# Headless smoke test: launches the Kit app + renderer (EGL) and pumps frames.
+# First run is slow (loads Kit extensions / compiles shaders).
+check-sim = { cmd = "python scripts/check_isaac.py", description = "Headless Isaac Sim launch + step (Blackwell renderer/extension init)" }
+# Full GUI (needs a display); first launch downloads assets.
+isaacsim = { cmd = "isaacsim", description = "Launch the Isaac Sim GUI" }
+
+# ---------------------------------------------------------------------------
+# Environments (solved independently)
+# ---------------------------------------------------------------------------
+[environments]
+planner = ["planner", "ros"]
+sim = ["sim"]
+
+# ---------------------------------------------------------------------------
+# Tasks (planner-scoped; they use torch, so run with `-e planner`)
+# ---------------------------------------------------------------------------
+[feature.planner.tasks]
+# Phase 0 gate: does torch actually run a kernel on this GPU? (not just is_available)
+check-gpu = { cmd = "python scripts/check_gpu.py", description = "Verify torch runs a kernel on sm_120" }
+
+# Build cuRobo from source with --no-build-isolation so it sees the installed torch.
+build-curobo = { cmd = "bash scripts/build_curobo.sh", description = "Compile cuRobo against env torch+CUDA" }
+
+# Validate cuRobo once built: warmup + a real motion_gen plan (exercises warp PTX JIT
+# on sm_120; an import alone won't). cuda_env is auto-sourced via planner activation.
+check-curobo = { cmd = "python scripts/check_curobo.py", description = "Validate cuRobo: warmup + real motion_gen plan on the GPU" }
+
+# Regular safety check: run cuRobo's tests PER-FILE (fresh CUDA context each) so the
+# whole-suite cascade can't produce false failures. Optional path arg narrows scope:
+#   pixi run -e planner test-curobo external/curobo/curobo/tests/_src/motion
+test-curobo = { cmd = "bash scripts/test_curobo.sh", description = "Run cuRobo tests per-file (isolated CUDA context; avoids the whole-suite cascade)" }
+
+# Core planner setup after `pixi install`: GPU gate -> cuRobo build -> cuRobo smoke test.
+# nvblox is NOT used: its 2024 fork won't build on CUDA 12.8/Blackwell. Perception
+# (depth->ESDF) collision is available via curobov2's native warp mapper if needed later.
+setup = { depends-on = ["check-gpu", "build-curobo", "check-curobo"], description = "Core planner native build + checks (cuRobo)." }

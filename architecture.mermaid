@@ -1,0 +1,52 @@
+flowchart TB
+    subgraph EXT["Upstream (external)"]
+        VIS["Vision Pipeline<br/>ranked grasp set<br/>ranked place set<br/>object poses<br/>scene depth + camera pose"]
+    end
+
+    subgraph CAMS["Sensors (multi-camera, base-frame normalized)"]
+        PCAM["Pick camera (fixed or EIH)"]
+        QCAM["Place camera (fixed or EIH)"]
+        ACAM["Aux cameras"]
+    end
+
+    subgraph SYS["Motion Planning System (ROS2 process, cuRobo embedded)"]
+        PFA["Perception Frame Adapter<br/>normalize all data to robot base frame<br/>fixed = static extrinsic<br/>EIH = extrinsic x FK at capture"]
+        CWM["Collision World Manager<br/>cuRobo Scene = static meshes/cuboids<br/>+ per-cycle ESDF voxel layers (native warp mapper)<br/>+ attached object body<br/>self-filter via depth masking"]
+        SCB["Segment / Constraint Builder<br/>pre-grasp, approach, grasp,<br/>retract, transport, place, release"]
+        MP["Motion Planner (cuRobo v0.8.0)<br/>plan_pose / plan_grasp over GoalToolPose goalset<br/>IK + trajopt + pose-cost metric<br/>parallel seeds + ranking"]
+        TGM["Tool & Gripper Manager<br/>tool library, per-width collision geom,<br/>active TCP, actuation commands"]
+        COORD["Task Coordinator (state machine)<br/>segment sequencing, sync barriers,<br/>candidate fallback, recapture"]
+        EXA["Execution Adapter (OEM-agnostic)"]
+        JSS["Joint State Source"]
+    end
+
+    subgraph CELL["Robot cell"]
+        CTRL["Robot Controller<br/>RAPID socket server (MVP)<br/>ring buffer + MoveAbsJ + zones"]
+        ROBOT["Manipulator + tool changer + positioner"]
+        TOOLC["Tool / gripper / positioner actuation"]
+    end
+
+    subgraph SIM["Validation"]
+        ISAAC["Isaac Sim digital twin"]
+    end
+
+    PCAM --> PFA
+    QCAM --> PFA
+    ACAM --> PFA
+    VIS -->|"grasp / place candidates (base frame)"| COORD
+    VIS -->|"object pose -> grasp transform"| TGM
+    PFA -->|"base-frame depth + pose"| CWM
+
+    COORD --> SCB
+    SCB --> MP
+    CWM --> MP
+    TGM -->|"active TCP + collision body"| MP
+    MP -->|"ranked collision-free trajectories"| COORD
+    COORD -->|"selected timed trajectory"| EXA
+    COORD -->|"actuation cmd: width / force / mode"| TGM
+    TGM --> TOOLC
+    EXA -->|"waypoints + speed + zone (socket)"| CTRL
+    CTRL --> ROBOT
+    CTRL -->|"joint feedback"| JSS
+    JSS -->|"start config q0"| MP
+    EXA -. "alternate execution target" .-> ISAAC
