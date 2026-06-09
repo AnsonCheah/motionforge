@@ -1,0 +1,36 @@
+# pyproject.toml — motionforge core library
+#
+# `motionforge` is the ROS-agnostic core library that embeds cuRobo (curobov2) and
+# holds every SPEC module. ROS2 ament packages live under src/ and import this lib.
+#
+# Runtime deps (torch, numpy, curobo, trimesh, warp-lang, ...) are provided by the pixi
+# `planner` env — NOT redeclared here — so installing this package never perturbs the
+# validated lockfile. Tests run via the pixi `test` / `test-unit` / `test-gpu` tasks.
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "motionforge"
+version = "0.1.0"
+description = "GPU motion planning pipeline for bin picking (cuRobo curobov2 + ROS2)"
+requires-python = ">=3.12"
+dependencies = []  # supplied by the pixi planner env
+
+[tool.setuptools.packages.find]
+include = ["motionforge*"]
+
+[tool.pytest.ini_options]
+minversion = "7.0"
+testpaths = ["tests"]
+# Make `import motionforge` work from the repo root without an install step
+# (keeps pixi.lock stable). `src/motionforge_ros` lets the ROS smoke test import the node
+# package without a colcon build. A `dev-install` editable install is optional.
+pythonpath = [".", "src/motionforge_ros"]
+addopts = "-ra"
+markers = [
+    "gpu: requires a CUDA GPU + cuRobo (deselect with -m 'not gpu')",
+    "integration: multi-component / fake-server tests",
+    "ros: requires a ROS2 environment",
+]

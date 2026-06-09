@@ -135,6 +135,8 @@ OMNI_KIT_ACCEPT_EULA = "YES"
 check-sim = { cmd = "python scripts/check_isaac.py", description = "Headless Isaac Sim launch + step (Blackwell renderer/extension init)" }
 # Full GUI (needs a display); first launch downloads assets.
 isaacsim = { cmd = "isaacsim", description = "Launch the Isaac Sim GUI" }
+# Manual acceptance twin (SPEC §9): bring up Isaac + UR10e and play back a planned trajectory.
+validate-isaac = { cmd = "python scripts/validate_isaac.py", description = "Isaac Sim validation twin (manual acceptance)" }
 
 # ---------------------------------------------------------------------------
 # Environments (solved independently)
@@ -166,3 +168,23 @@ test-curobo = { cmd = "bash scripts/test_curobo.sh", description = "Run cuRobo t
 # nvblox is NOT used: its 2024 fork won't build on CUDA 12.8/Blackwell. Perception
 # (depth->ESDF) collision is available via curobov2's native warp mapper if needed later.
 setup = { depends-on = ["check-gpu", "build-curobo", "check-curobo"], description = "Core planner native build + checks (cuRobo)." }
+
+# --- motionforge package tests (the in-loop, per-phase build verification) ---
+# Full suite: unit + GPU + integration (the user has the GPU). `import motionforge` works
+# from the repo root via pyproject's pytest pythonpath=["."] — no install needed.
+test = { cmd = "pytest tests -q", description = "Run all motionforge tests (unit + gpu + integration)" }
+# Fast, GPU-free subset for quick iteration / CI without a GPU.
+test-unit = { cmd = "pytest tests -q -m 'not gpu and not ros'", description = "Run motionforge unit tests (no GPU)" }
+# GPU-only subset (cuRobo plan calls). If the shared-CUDA-context cascade ever bites,
+# switch to per-file isolation like scripts/test_curobo.sh.
+test-gpu = { cmd = "pytest tests/gpu -q", description = "Run motionforge GPU tests (cuRobo)" }
+# Optional: editable install of the lib (only needed for the ROS2 layer / external import).
+dev-install = { cmd = "pip install -e . --no-deps --no-build-isolation", description = "Editable-install the motionforge lib into the planner env" }
+
+# Launch the thin ROS2 planner node (params from src/motionforge_ros/config/params.yaml).
+# Requires the lib importable: `pixi run -e planner dev-install` first (or PYTHONPATH=.).
+planner-node = { cmd = "python src/motionforge_ros/motionforge_ros/planner_node.py", env = { PYTHONPATH = "." }, description = "Run the motionforge ROS2 planner node" }
+
+# Headless pick-and-place demo in cuRobo's native Viser visualizer (browser at :8080).
+# No Isaac, no display needed. Append args after `--`, e.g. `pixi run -e planner demo -- --once`.
+demo = { cmd = "python scripts/demo_pick_place.py", env = { PYTHONPATH = "." }, description = "Pick-and-place demo in cuRobo's Viser visualizer" }
