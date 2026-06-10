@@ -39,6 +39,7 @@ Node responsibilities:
 
 | Module | Responsibility |
 |---|---|
+| Cell Config Loader | Load the declarative per-deployment `CellConfig` (YAML manifest + referenced geometry assets) at startup. The static collision world, camera registry, ESDF ROI layers, and tool library all derive from it — **not authored in code**. This is the artifact that makes the stack deployable across cells with different layouts. |
 | Perception Frame Adapter | Normalize every camera's data to the robot **base frame**. Fixed camera: static extrinsic. EIH: extrinsic × FK(capture config). Output base-frame depth + camera pose. |
 | Collision World Manager | Maintain cuRobo's `Scene`: persistent static `Cuboid`/`Mesh` + per-cycle ESDF `VoxelGrid` layers (`pick_bin`, `place_tray`) from the native warp mapper + attached-object body. Self-filter the robot from depth. |
 | Segment / Constraint Builder | Expand a phase template into `MotionSegment`s. Map the grasp phase onto `plan_grasp` (approach→grasp→lift); map free/transport moves onto `plan_pose` with a pose-cost metric for held constraints. |
@@ -125,18 +126,56 @@ class PlanResult:
     trajectory: Optional[JointTrajectory]       # timed, dense (internal representation)
     candidate_index: int                        # which goalset entry was selected
     metrics: Dict[str, float]                   # cycle_time, peak_jerk, min_clearance, ...
+
+# --- Deployment artifact: the cell config (scene-as-data, not code) ---
+# Per-deployment declarative description of a robot cell. Loaded once at startup;
+# the static collision world, camera registry, ESDF layers, and tool library all
+# derive from it instead of being assembled in code. See Section 5.8.
+
+@dataclass
+class CameraEntry:                 # one row of the camera registry (was an inline dict in 5.1)
+    camera_id: str
+    mount: str                     # "fixed" | "eih"
+    extrinsic: Pose                # fixed: cam->base ; eih: cam->flange (compose with FK at capture)
+    role: str                      # "pick" | "place" | "aux"
+
+@dataclass
+class ROIEntry:                    # per-cycle ESDF layer definition (was config params)
+    name: str                      # "pick_bin" | "place_tray"
+    origin: Pose                   # base-frame ESDF origin
+    extent_m: Vec3                 # voxel-grid bounds
+    voxel_size_m: float
+
+@dataclass
+class StaticBody:                  # persistent static-world entry with placement
+    name: str
+    body: CollisionBody            # kind in {"primitive","mesh"}; data inline OR via asset_path
+    transform: Pose                # base-frame placement
+    asset_path: Optional[str]      # for kind=="mesh": path to mesh/USD asset (else inline data)
+
+@dataclass
+class CellConfig:                  # per-deployment declarative artifact: YAML manifest + asset refs
+    robot_base_frame: str
+    robot_mount: Pose              # robot base placement (identity if base IS the cell frame)
+    cameras: List[CameraEntry]     # -> Perception Frame Adapter registry (5.1)
+    static_bodies: List[StaticBody]# -> Collision World Manager persistent world (5.2)
+    rois: List[ROIEntry]           # -> per-cycle ESDF layers (5.2)
+    tools: List[ToolDescriptor]    # -> Tool & Gripper Manager library (5.4)
+    # Authoritative, git-diffable. Geometry assets (mesh/USD) referenced by path.
 ```
+
+`CellConfig` is the unit of deployment: standing up a cell with a different layout means authoring this manifest plus its geometry assets — no code change. It is also the common, base-frame representation that future **scene-source adapters** (Section 5.8, deferred) populate.
 
 ## 5. Module detail
 
 ### 5.1 Perception Frame Adapter
-- Camera registry: `{camera_id: {mount: "fixed"|"eih", extrinsic: Pose, role: "pick"|"place"|"aux"}}`.
+- Camera registry: loaded from the `CellConfig` manifest (`cameras: List[CameraEntry]`, Section 4) — `{camera_id: {mount: "fixed"|"eih", extrinsic: Pose, role: "pick"|"place"|"aux"}}`. Not hardcoded.
 - For EIH, requires the **capture-time joint config** to compute camera→base via FK. Vision must tag captures with that config, or the adapter samples `q` at capture.
 - Output: base-frame depth image + base-frame camera pose, ready for ESDF integration by the native mapper.
 
 ### 5.2 Collision World Manager (cuRobo curobov2)
 - Build one cuRobo `Scene` collision world combining `Cuboid`/`Mesh` (static) and `VoxelGrid` ESDF layers (per-cycle). cuRobo composes these in one collision query.
-- **Static cell geometry**: meshes/cuboids loaded once (persistent).
+- **Static cell geometry**: loaded once (persistent) from `CellConfig.static_bodies` (Section 4) — primitives inline, meshes/USD via `asset_path`, each placed by its base-frame `transform`. ESDF ROI layers below are defined by `CellConfig.rois`.
 - **Per-cycle perception** (`pick_bin`, `place_tray`): use cuRobo's **native warp `Mapper`** (`curobo._src.perception.mapper`). Per cycle: `mapper.integrate(...)` the base-frame depth → `mapper.compute_esdf()` → `VoxelGrid`, then push it into the collision world via `scene_collision.update_voxel_data(...)`. This is the nvblox replacement — pure warp, no external C++ library.
 - Self-filter: zero the robot's region in the depth image before integration (plus cuRobo robot segmentation).
 - Attached object: add as a `Mesh`/`Sphere` on the tool frame on grasp confirmation; remove on release. Use `disable_collision_links` to permit object↔gripper contact while still checking object↔arm.
@@ -151,7 +190,7 @@ class PlanResult:
 - `min_clearance_m` acts as a hard filter; cycle time and smoothness are the soft objectives (Section 8).
 
 ### 5.4 Tool & Gripper Manager
-- Tool library keyed by `tool_id`; switching updates the **active TCP** (the tool frame in `GoalToolPose.tool_frames` / kinematics EE link).
+- Tool library (`CellConfig.tools: List[ToolDescriptor]`, Section 4) keyed by `tool_id`; switching updates the **active TCP** (the tool frame in `GoalToolPose.tool_frames` / kinematics EE link).
 - Gripper collision geometry is a function of commanded `width_m` (Section 4 `collision_geom_fn`). Always reflect the **actual commanded width per segment** (open/standby width during approach is wider and must clear neighbors). Never use a fixed worst-case envelope (false negatives).
 - `force` and `mode` are passed to actuation only; planner ignores them.
 - Grasp transform (object pose in gripper) derived from `object_pose ⊖ grasp_pose`, used to place the attached body relative to the TCP.
@@ -170,6 +209,12 @@ States: `PERCEIVE_PICK → PLAN_PICK → EXEC_PICK → PERCEIVE_PLACE → PLAN_P
 ### 5.7 Joint State Source
 - MVP: parse joint feedback from the RAPID socket server. Provide `q0` to the planner as the trajectory start.
 - Hook for an alternative EtherNet/IP read from the controller (deferred).
+
+### 5.8 Cell Config & Commissioning
+- **In scope (MVP):** the `CellConfig` data model (Section 4) and its loader. The artifact is a thin **YAML manifest + referenced geometry assets**: the manifest holds the semantic, human-diffable fields (camera roles, robot mount, ROIs, transforms, tool library); geometry (mesh/USD) is referenced by path. Loaded once at startup; replaces code-level scene assembly in §5.1/§5.2/§5.4.
+- **Deferred — scene-source adapter boundary (design hook only):** populating `static_bodies` is done behind a fixed adapter boundary, the same pattern as the Execution Adapter (§5.6). All adapters emit `CollisionBody` in the robot **base frame**, so the planner is agnostic to the source. Planned sources: a **reused 3D editor** (Isaac/Blender/FreeCAD via the asset format — baseline; not a bespoke editor), **TCP touch-probe** (fit primitives from FK), **EIH/fixed scan** (multi-view fuse → cleanup → primitives/mesh), **CAD import**. A cell may mix sources by region.
+- **Deferred — alignment backstop:** the one invariant across varied sites is the robot's FK / base frame, so **TCP touch-registration** is the universal mechanism for aligning any non-base-native source (CAD, external scans) to the base.
+- **Deferred — coverage-verification gate:** overlay the committed static world against a fresh empty-cell capture; flag *missed* obstacles (cloud with no nearby geometry) and *phantom* obstacles (geometry with no cloud support). This is the safety net for human measurement error (see CONTEXT §3).
 
 ## 6. Per-cycle sequence
 
@@ -237,7 +282,8 @@ sequenceDiagram
 
 ## 9. Validation and acceptance
 
-- Isaac Sim digital twin loads the same URDF and the same `WorldSnapshot`; the planned trajectory executes in sim before/instead of hardware (Execution Adapter has an Isaac target).
+- Isaac Sim digital twin loads the same URDF and `CellConfig` (static world) and validates against the same `WorldSnapshot` (static + per-cycle perceived geometry); the planned trajectory executes in sim before/instead of hardware (Execution Adapter has an Isaac target).
+- **Tool roles (visualization):** **RViz** (already in the ROS2 stack) is the operational viewer — point cloud, ESDF voxels, planned trajectory, robot state, interactive-marker goals. **Isaac Sim** is the high-fidelity validation twin. A 3D editor for *authoring* the `CellConfig` is a **reused** tool (Isaac/Blender/FreeCAD via the asset format), kept **optional — never a mandatory runtime/commissioning dependency**. Online robot jogging stays on the teach pendant (functional safety); the GUI's online role is visualization, not commanding.
 - Acceptance (MVP):
   - Plans a full pick-and-place for a rigid part against bin + static cell + re-perceived tray, collision-free in sim.
   - Honors straight-line approach/retract and orientation-hold-on-carry constraints.
@@ -276,4 +322,5 @@ sequenceDiagram
 - Deformable workpiece: post-grasp rescan; handle partial-object scan gaps.
 - Tool-change motion generation; off-cycle mating-point calibration.
 - Learned cost/sampler or VLA terminal skill behind the cuRobo validity gate.
+- Commissioning / scene capture (the `CellConfig` boundary is ready; §5.8): scene-source adapters (TCP touch-probe, EIH/fixed scan, CAD import) emitting `CollisionBody` in base frame; a reused 3D editor (Isaac/Blender/FreeCAD) for cell-config authoring — no bespoke editor; TCP touch-registration as the universal base-frame alignment backstop; a coverage-verification gate (committed world vs. fresh empty-cell capture) flagging missed and phantom obstacles.
 - Functional safety: software avoidance is not safety-rated; safety hardware (scanners, safety-rated monitored stop) is required for any shared-workspace operation.

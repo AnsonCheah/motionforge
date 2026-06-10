@@ -18,6 +18,7 @@ flowchart TB
         COORD["Task Coordinator (state machine)<br/>segment sequencing, sync barriers,<br/>candidate fallback, recapture"]
         EXA["Execution Adapter (OEM-agnostic)"]
         JSS["Joint State Source"]
+        CFG["Cell Config Loader<br/>declarative CellConfig (YAML manifest + assets)<br/>static geometry · camera registry · ROIs · tool library<br/>loaded once at startup"]
     end
 
     subgraph CELL["Robot cell"]
@@ -36,6 +37,9 @@ flowchart TB
     VIS -->|"grasp / place candidates (base frame)"| COORD
     VIS -->|"object pose -> grasp transform"| TGM
     PFA -->|"base-frame depth + pose"| CWM
+    CFG -->|"camera registry"| PFA
+    CFG -->|"static world + ESDF ROIs"| CWM
+    CFG -->|"tool library"| TGM
 
     COORD --> SCB
     SCB --> MP

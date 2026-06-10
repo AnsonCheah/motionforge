@@ -49,10 +49,19 @@ Vision guarantees a collision-free *final place pose*, not a collision-free *pat
 ### 2.9 Robot base frame as the canonical frame
 There are pick, place, and possibly auxiliary cameras, sometimes arm-mounted for both phases. Normalizing everything to the robot base frame keeps one consistent planning frame regardless of how many cameras exist or how they are mounted. The Perception Frame Adapter handles fixed extrinsics and eye-in-hand (extrinsic × FK at capture).
 
+### 2.10 Declarative cell config — scene as data, not code
+For a package deployed across multiple cells, the static scene (cell geometry, camera extrinsics, robot mount, bin/tray ROIs, tool library) must be **data, not code**. Originally these were assembled in code, so a new layout required coding-level work — the actual deployability gap (Isaac Sim being "optional validation" was never the issue). The fix is a declarative per-deployment `CellConfig` artifact, loaded once at startup (SPEC §4, §5.8).
+
+- **Adapter-boundary philosophy, reused.** This mirrors the Execution Adapter (§2.7): future scene-source adapters (touch-probe, scan, CAD import) sit behind one common base-frame representation (`CellConfig` / `CollisionBody`), so the planner is agnostic to how geometry was captured. A cell can mix sources by region.
+- **Why YAML manifest + asset refs (not USD-only).** Keep the semantic, safety-relevant fields (camera roles, ROIs, transforms) human-diffable and runtime-loadable today; let geometry assets (mesh/USD) come from any 3D editor. A pure-USD scene is heavier, not git-diffable, and awkward for that metadata.
+- **The editor is reused, not built.** A bespoke 3D editor is *more* code, not less. Isaac/Blender/FreeCAD already import meshes, create primitives, and place them with gizmos — they author the cell config via the asset format. This is Isaac's concrete *optional* commissioning role; it never becomes mandatory (footprint: ~tens of GB + RTX + a separate env per site).
+- **Alignment invariant.** The one thing present and trustworthy at every site is the robot's FK / base frame, so **TCP touch-registration** is the single universal mechanism for aligning any non-base-native source to the base. Calibration is not "extra": EIH runtime perception already owes hand-eye calibration, so a commissioning scan reuses it — the real limit is camera *coverage*, not calibration.
+
 ## 3. Caveats and risks (must respect)
 
 - **Dense clutter is an open problem for voxel-based collision.** cuRobo's own docs state camera-perceived collision-free planning works well in *sparse* environments. A bin of intertwined parts is dense. Division of labor: vision owns "can I reach into the clutter" (it supplies a reachable grasp + standoff); the planner owns gross free-space motion plus approach/retract-line clearance against the cell and the bin's outer geometry. Do not expect the planner to thread dense clutter from voxels alone.
 - **Software collision avoidance is not functional safety.** Any shared-workspace or dynamic-scene operation requires safety-rated hardware (safety scanners, safety-rated monitored stop). EGM in particular bypasses the controller's own collision avoidance, so the planner must own collision when EGM is later used.
+- **Static-world coverage is a safety concern.** Free space must be *positively established, not assumed*: a structural obstacle missing from the `CellConfig` static world and outside the per-cycle ESDF ROIs is treated as free space, and the arm will route straight through it. Unmodeled regions should flag/block, not default to free. Human measurement in a 3D editor is exactly where this error enters, which is why the coverage-verification gate (committed world overlaid against a fresh empty-cell capture; flag missed and phantom obstacles) is the net. Online robot jogging stays on the teach pendant — the GUI's online role is visualization, not commanding.
 - **Perception mapping is per-cycle.** Re-integrate the native warp mapper each cycle (clear / re-integrate, or move the ESDF origin for a sliding window). Unlike the old nvblox path there is no in-process re-init CUDA quirk — it is native warp. Still validate the mapper + planner integration early on the target GPU.
 - **Constraints are soft costs.** curobov2's pose-cost metric (the held-orientation/partial-pose term) is added as a cost, so trajectories will not land exactly on the offset pose and orientation hold is approximate; tune weights. Linear approach is easiest axis-aligned; off-axis approach requires aligning the constraint reference frame. The grasp approach itself is encapsulated by `plan_grasp`.
 - **Socket timing fidelity.** Waypoint-following timing is owned by the RAPID interpolator, not the planner. Acceptable for one-shot static picks; revisit when precise timing or replanning is needed.
@@ -66,6 +75,7 @@ There are pick, place, and possibly auxiliary cameras, sometimes arm-mounted for
 4. **Learning-based:** learned cost/sampler or a VLA terminal manipulation skill for the in-clutter grasp, with cuRobo/classical validity as the gatekeeper on any learned output.
 5. **Tool-change motion** generation with off-cycle mating-point calibration.
 6. **Multi-arm / multi-robot** shared-workspace collision.
+7. **Commissioning / scene capture:** scene-source adapters (TCP touch-probe, EIH/fixed scan, CAD import) + a reused 3D editor + the coverage-verification gate, all behind the `CellConfig` boundary (the data model itself ships first).
 
 ## 5. Glossary
 
@@ -82,6 +92,10 @@ There are pick, place, and possibly auxiliary cameras, sometimes arm-mounted for
 - **EtherNet/IP (EIP)** — industrial fieldbus; a possible future channel for joint feedback from the controller.
 - **TAMP** — Task and Motion Planning; jointly planning the discrete task sequence and the motions. Out of scope; we use a fixed pick-place template.
 - **MoveIt2 / cuMotion** — ROS2 motion-planning framework / NVIDIA's cuRobo-backed MoveIt2 plugin. Deliberately not used; cuRobo is embedded directly.
+- **Cell config** — the per-deployment declarative artifact (`CellConfig`, SPEC §4): a git-diffable YAML manifest (camera registry, robot mount, ROIs, tool library, static-body transforms) plus referenced geometry assets. The unit of deployment and the common base-frame representation all scene-source adapters emit into.
+- **Scene-source adapter** — a pluggable producer of static-world geometry (reused 3D editor, TCP touch-probe, scan, CAD import) behind a fixed boundary, all emitting `CollisionBody` in the robot base frame. Same pattern as the Execution Adapter. Deferred.
+- **TCP touch-registration** — using the robot's own FK as a metrology tool: jog the TCP to touch known points/features and record configurations to fit primitives or align imported geometry to the base frame. The universal alignment backstop because FK is the one invariant across varied sites.
+- **USD** — Universal Scene Description; Pixar/NVIDIA's 3D scene/interchange format, native to Isaac Sim/Omniverse and supported by cuRobo's USD helpers. Here it is one option for the geometry *assets* a cell config references, and the bridge that lets Isaac act as an optional cell-config editor.
 
 ## 6. References
 
