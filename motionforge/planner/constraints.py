@@ -20,6 +20,7 @@ from typing import List, Optional
 
 import numpy as np
 
+from motionforge.geometry import Pose, quat_conjugate, quat_rotate_vector
 from motionforge.types import SegmentConstraints
 
 
@@ -32,9 +33,21 @@ def reorder_hold_weight(spec_weight) -> List[float]:
 
 
 def vector_to_principal_axis(vec3) -> str:
-    """Dominant principal axis ('x'|'y'|'z') of a base-frame vector (for linear approach)."""
+    """Dominant principal axis ('x'|'y'|'z') of a vector."""
     a = np.abs(np.asarray(vec3, dtype=float).reshape(-1))
     return ["x", "y", "z"][int(np.argmax(a))]
+
+
+def approach_axis_in_goal_frame(axis_base, goal_quat) -> np.ndarray:
+    """Express a base-frame axis in the GOAL frame: ``R(goal_quat)^T @ axis_base``.
+
+    cuRobo's ``ToolPoseCriteria.linear_motion(axis=...)`` with ``project_distance_to_goal=True``
+    applies the axis weighting in the goal/tool frame (verified in
+    ``curobo/_src/cost/wp_torch_pose_dist.py``), so a base-frame approach vector must be rotated
+    into the goal frame before choosing the principal axis. Otherwise a rotated grasp gets the
+    wrong free/constrained axes and the "straight-line" approach bends.
+    """
+    return quat_rotate_vector(quat_conjugate(goal_quat), np.asarray(axis_base, dtype=float))
 
 
 def hold_orientation_weights(constraints: SegmentConstraints) -> tuple[List[float], List[float]]:
@@ -50,19 +63,29 @@ def build_tool_pose_criteria(
     constraints: SegmentConstraints,
     device_cfg=None,
     axis: Optional[str] = None,
+    goal: Optional[Pose] = None,
 ):
-    """Build the cuRobo ``ToolPoseCriteria`` for a segment (CUDA — lazy import)."""
+    """Build the cuRobo ``ToolPoseCriteria`` for a segment (CUDA — lazy import).
+
+    ``goal`` (the segment's target pose) is used to map the base-frame ``approach_axis`` into
+    the goal frame before picking the linear-motion principal axis. Without it, the base-frame
+    axis is used directly (correct only when the goal orientation is axis-aligned with base).
+    """
     from curobo._src.cost.tool_pose_criteria import ToolPoseCriteria
     from curobo._src.types.device_cfg import DeviceCfg
 
     dc = device_cfg or DeviceCfg()
 
     if constraints.linear_approach:
-        principal = axis or (
-            vector_to_principal_axis(constraints.approach_axis)
-            if constraints.approach_axis is not None
-            else "z"
-        )
+        if axis is not None:
+            principal = axis
+        elif constraints.approach_axis is not None:
+            axis_vec = constraints.approach_axis
+            if goal is not None:
+                axis_vec = approach_axis_in_goal_frame(axis_vec, goal.quaternion)
+            principal = vector_to_principal_axis(axis_vec)
+        else:
+            principal = "z"
         return ToolPoseCriteria.linear_motion(
             axis=principal, non_terminal_scale=1.0, project_distance_to_goal=True
         )

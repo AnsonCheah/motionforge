@@ -94,10 +94,17 @@ def _grasp_candidate(planner, deltas, standoff=0.1) -> GraspCandidate:
     )
 
 
+def test_plan_grasp_warns_when_not_acknowledged(mf_planner):
+    # plan_grasp is broken in this build; calling it without acknowledging warns loudly.
+    cand = _grasp_candidate(mf_planner, [0.3, -0.1, 0.1])
+    with pytest.warns(RuntimeWarning, match="broken in this curobov2 build"):
+        mf_planner.plan_grasp([cand], plan_approach_to_grasp=False, plan_grasp_to_lift=False)
+
+
 def test_plan_grasp_reach_only_succeeds(mf_planner):
     cand = _grasp_candidate(mf_planner, [0.3, -0.1, 0.1])
     plan = mf_planner.plan_grasp(
-        [cand], plan_approach_to_grasp=False, plan_grasp_to_lift=False
+        [cand], plan_approach_to_grasp=False, plan_grasp_to_lift=False, acknowledge_broken=True
     )
     assert isinstance(plan, GraspPlan)
     assert plan.success
@@ -118,6 +125,7 @@ def test_plan_grasp_full_approach_lift_returns_phases(mf_planner):
         grasp_lift_offset=0.1,
         plan_approach_to_grasp=True,
         plan_grasp_to_lift=True,
+        acknowledge_broken=True,
     )
     assert isinstance(plan, GraspPlan)
     assert plan.status  # human-readable status always set
@@ -133,11 +141,12 @@ def test_plan_grasp_disable_collision_links_path_runs(mf_planner):
         disable_collision_links=[],
         plan_approach_to_grasp=False,
         plan_grasp_to_lift=False,
+        acknowledge_broken=True,
     )
     assert isinstance(plan, GraspPlan)
 
 
 def test_plan_grasp_no_candidates(mf_planner):
-    plan = mf_planner.plan_grasp([])
+    plan = mf_planner.plan_grasp([], acknowledge_broken=True)
     assert isinstance(plan, GraspPlan)
     assert not plan.success

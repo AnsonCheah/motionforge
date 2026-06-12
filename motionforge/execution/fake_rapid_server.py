@@ -38,6 +38,7 @@ class FakeRapidServer:
         self.received_count = 0
         self.consumed_count = 0
         self.max_buffer_depth = 0
+        self.received_dts: List[float] = []  # per-waypoint planned dt_s, in consume order
 
         self._lt: Optional[LoopThread] = None
         self._server: Optional[asyncio.AbstractServer] = None
@@ -112,7 +113,11 @@ class FakeRapidServer:
                 await asyncio.sleep(self._consume_dt)
                 continue
             wp = buffer.get_nowait()
-            await asyncio.sleep(self._consume_dt)  # simulate motion to the waypoint
+            # Honor the planned per-waypoint timing when supplied (fall back to the fixed rate
+            # for legacy frames without dt_s).
+            dt = wp.get("dt_s")
+            self.received_dts.append(float(dt) if dt is not None else self._consume_dt)
+            await asyncio.sleep(dt if dt else self._consume_dt)  # simulate motion to the waypoint
             self.current_q = list(wp["q"])
             self.consumed_count += 1
             writer.write(

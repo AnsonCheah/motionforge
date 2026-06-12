@@ -67,3 +67,51 @@ def test_connect_reports_q0_before_motion():
     finally:
         adapter.close()
         server.stop()
+
+
+def _timed_zigzag(times, dof=6):
+    """A zigzag (all points kept by down-sampling) with explicit per-point time_from_start."""
+    points = []
+    for i, t in enumerate(times):
+        q = [HOME_Q[j] + 0.02 * ((-1) ** i) + 0.001 * i for j in range(dof)]
+        points.append((q, [0.0] * dof, [0.0] * dof, float(t)))
+    return JointTrajectory(joint_names=[f"j{j}" for j in range(dof)], points=points)
+
+
+def test_per_waypoint_dt_transmitted():
+    # The planned per-waypoint timing reaches the controller (kept-index time deltas).
+    times = [0.0, 0.1, 0.25, 0.3, 0.7, 0.95]
+    server = FakeRapidServer(home_q=HOME_Q, consume_dt=0.001)
+    port = server.start()
+    adapter = AbbSocketAdapter("127.0.0.1", port, max_joint_error=1e-6)
+    try:
+        adapter.connect()
+        adapter.send_trajectory(_timed_zigzag(times))
+        expected = [0.0, 0.1, 0.15, 0.05, 0.4, 0.25]  # consecutive deltas (first = its own t)
+        assert np.allclose(server.received_dts, expected, atol=1e-6)
+    finally:
+        adapter.close()
+        server.stop()
+
+
+def test_loopback_duration_matches_planned():
+    # Honoring dt_s makes the controller-side execution take ~the planned trajectory duration.
+    times = [0.05 * i for i in range(8)]  # planned duration 0.35 s
+    planned = times[-1]
+    server = FakeRapidServer(home_q=HOME_Q, consume_dt=0.001)
+    port = server.start()
+    adapter = AbbSocketAdapter("127.0.0.1", port, max_joint_error=1e-6)
+    try:
+        adapter.connect()
+        import time
+
+        t0 = time.perf_counter()
+        adapter.send_trajectory(_timed_zigzag(times))
+        wall = time.perf_counter() - t0
+        # Loose bounds (CI jitter + pipelining): within ~[0.5x, 2.5x] of planned, and clearly
+        # not instant (proves dt is honored, not ignored).
+        assert 0.5 * planned <= wall <= 2.5 * planned + 0.2
+        assert sum(server.received_dts) == pytest.approx(planned, abs=1e-6)
+    finally:
+        adapter.close()
+        server.stop()

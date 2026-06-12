@@ -5,7 +5,8 @@ import pytest
 
 from motionforge.geometry import Pose
 from motionforge.tools import ToolManager, parallel_jaw_geom_fn, vacuum_geom_fn
-from motionforge.types import GripConfig, ToolDescriptor
+from motionforge.tools.tool_manager import collision_body_to_cuboid_specs
+from motionforge.types import CollisionBody, GripConfig, ToolDescriptor
 
 QZ90 = np.array([np.cos(np.pi / 4), 0.0, 0.0, np.sin(np.pi / 4)])
 
@@ -83,3 +84,41 @@ def test_vacuum_geom_fn_is_cylinder():
     body = m.collision_geom(GripConfig(width_m=0.0, mode="vacuum_on"))
     assert "cylinder" in body.data
     assert body.data["cylinder"]["radius"] == 0.02
+
+
+# -- collision_body_to_cuboid_specs (gripper geometry -> cuRobo cuboid specs) --
+
+
+def test_jaw_specs_track_width_and_count():
+    fn = parallel_jaw_geom_fn(jaw_length=0.04, jaw_thickness=0.02, jaw_height=0.05)
+    narrow = collision_body_to_cuboid_specs(fn(GripConfig(width_m=0.02)))
+    wide = collision_body_to_cuboid_specs(fn(GripConfig(width_m=0.08)))
+    # base + two jaws.
+    names = {s["name"] for s in narrow}
+    assert names == {"tool_base", "tool_jaw0", "tool_jaw1"}
+    # Each spec carries dims + a 7-element pose [x,y,z, qw,qx,qy,qz] in the TCP frame.
+    for s in narrow:
+        assert len(s["pose"]) == 7 and len(s["dims"]) == 3
+    # The jaws separate further at the wider commanded width.
+    nx = abs(next(s for s in narrow if s["name"] == "tool_jaw0")["pose"][0])
+    wx = abs(next(s for s in wide if s["name"] == "tool_jaw0")["pose"][0])
+    assert wx > nx
+
+
+def test_vacuum_specs_bounding_cuboid():
+    fn = vacuum_geom_fn(radius=0.02, length=0.04)
+    specs = collision_body_to_cuboid_specs(fn(GripConfig(width_m=0.0, mode="vacuum_on")))
+    assert len(specs) == 1
+    s = specs[0]
+    assert s["dims"] == [0.04, 0.04, 0.04]  # 2r x 2r x length
+    assert s["pose"][2] == 0.02  # centered at length/2 along +Z
+
+
+def test_bad_collision_body_kind_raises():
+    with pytest.raises(ValueError, match="kind='primitive'"):
+        collision_body_to_cuboid_specs(CollisionBody(kind="mesh", data={}, frame="tcp"))
+
+
+def test_unrecognized_primitive_schema_raises():
+    with pytest.raises(ValueError, match="unrecognized gripper primitive schema"):
+        collision_body_to_cuboid_specs(CollisionBody(kind="primitive", data={"foo": 1}, frame="tcp"))

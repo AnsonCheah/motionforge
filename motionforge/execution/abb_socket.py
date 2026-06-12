@@ -145,7 +145,7 @@ class AbbSocketAdapter(ExecutionAdapter, JointStateSource):
             self._writer.write(
                 encode_json(
                     MessageType.WAYPOINT,
-                    {"q": wp.q, "speed": wp.speed, "zone": wp.zone, "index": idx},
+                    {"q": wp.q, "speed": wp.speed, "zone": wp.zone, "dt_s": wp.dt_s, "index": idx},
                 )
             )
             await self._writer.drain()

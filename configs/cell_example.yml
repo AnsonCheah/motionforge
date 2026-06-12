@@ -1,0 +1,83 @@
+# Example cell config (SPEC §4, §5.8) — per-deployment, scene-as-data.
+#
+# A git-diffable manifest describing one robot cell: static collision world, camera registry,
+# ESDF ROIs, and tool library. Geometry assets (mesh/USD) are referenced by path, resolved
+# relative to this file. Load with motionforge.cell_config.load_cell_config(path).
+#
+# All poses are SE3 in the robot BASE frame: position [x,y,z] metres, quaternion [w,x,y,z].
+
+robot_base_frame: base_link
+robot_mount:
+  position: [0.0, 0.0, 0.0]      # identity: the robot base IS the cell frame
+  quaternion: [1.0, 0.0, 0.0, 0.0]
+
+cameras:
+  - camera_id: cam_pick
+    mount: fixed                 # fixed: extrinsic is cam->base
+    role: pick
+    extrinsic:
+      position: [0.5, -0.3, 1.0] # ~1 m above the bin, looking down
+      quaternion: [0.0, 1.0, 0.0, 0.0]
+    intrinsics: [[600.0, 0.0, 320.0], [0.0, 600.0, 240.0], [0.0, 0.0, 1.0]]
+  - camera_id: cam_place
+    mount: fixed
+    role: place
+    extrinsic:
+      position: [0.5, 0.3, 1.0]
+      quaternion: [0.0, 1.0, 0.0, 0.0]
+    intrinsics: [[600.0, 0.0, 320.0], [0.0, 600.0, 240.0], [0.0, 0.0, 1.0]]
+
+# Persistent static cell geometry. Primitives are inline (dims); meshes reference asset_path.
+# THIS is the positively-established free space — anything missing here is treated as free
+# and the arm will route through it (CONTEXT §3). Keep it complete.
+static_bodies:
+  - name: table
+    kind: primitive
+    dims: [1.2, 1.0, 0.05]
+    transform:
+      position: [0.5, 0.0, -0.025]
+      quaternion: [1.0, 0.0, 0.0, 0.0]
+  - name: back_wall
+    kind: primitive
+    dims: [0.05, 1.0, 0.8]
+    transform:
+      position: [-0.15, 0.0, 0.4]
+      quaternion: [1.0, 0.0, 0.0, 0.0]
+  # Example mesh fixture (uncomment + provide the asset to use):
+  # - name: fixture
+  #   kind: mesh
+  #   asset_path: assets/fixture.obj
+  #   transform:
+  #     position: [0.5, 0.0, 0.05]
+  #     quaternion: [1.0, 0.0, 0.0, 0.0]
+
+# Per-cycle ESDF layers. All ROIs SHARE dims/voxel_size (the voxel cache is sized once) but
+# may sit at different base-frame origins.
+rois:
+  - name: pick_bin
+    origin:
+      position: [0.5, -0.3, 0.3]
+      quaternion: [1.0, 0.0, 0.0, 0.0]
+    extent_m: [0.6, 0.6, 0.6]
+    voxel_size_m: 0.01
+  - name: place_tray
+    origin:
+      position: [0.5, 0.3, 0.3]
+      quaternion: [1.0, 0.0, 0.0, 0.0]
+    extent_m: [0.6, 0.6, 0.6]
+    voxel_size_m: 0.01
+
+# Tool library. collision_geom_fn is resolved from a named builder (GEOM_REGISTRY) + params.
+tools:
+  - tool_id: jaw
+    tcp_pose:
+      position: [0.0, 0.0, 0.15]   # TCP 0.15 m past the flange (tool0) along +Z
+      quaternion: [1.0, 0.0, 0.0, 0.0]
+    geometry:
+      type: parallel_jaw
+      params:
+        jaw_length: 0.04
+        jaw_thickness: 0.02
+        jaw_height: 0.05
+    actuation_iface: "socket://gripper"
+    payload_kg: 0.5

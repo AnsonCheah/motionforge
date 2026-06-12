@@ -74,10 +74,14 @@ def _box_grid(box_center, half=(0.06, 0.06, 0.06)):
 def world():
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
-    # Initial empty voxel scene sizes the collision buffers; attached_object link enables attach.
+    # A 2-layer voxel cache sizes the collision buffers for pick_bin + place_tray as SEPARATE
+    # composing grids (the native batched path); attached_object link enables attach.
     adapter = MotionPlannerAdapter(
         config=TEST_CONFIG,
-        scene=Scene(voxel=[_empty_grid()]),
+        collision_cache={
+            "cuboid": 30, "mesh": 30,
+            "voxel": {"layers": 2, "dims": list(GRID_DIMS), "voxel_size": GRID_VS},
+        },
         attached_object_spheres=64,
     )
     adapter.warmup()
@@ -93,15 +97,21 @@ def _reachable_goal(adapter, deltas):
 # ── Scene assembly + update_world ──
 
 
-def test_build_scene_includes_layers_and_static(world):
+def test_static_scene_and_voxel_layers_are_separate(world):
     adapter, mgr = world
     mgr.set_static(cuboids=[Cuboid(name="table", pose=[0.4, 0, -0.05, 1, 0, 0, 0], dims=[0.8, 1.2, 0.05])])
     mgr.set_voxel_layer(PICK_BIN_LAYER, _empty_grid())
-    scene = mgr.build_scene()
-    assert scene.voxel is not None and len(scene.voxel) == 1
-    assert scene.voxel[0].name == PICK_BIN_LAYER
+    mgr.set_voxel_layer(PLACE_TRAY_LAYER, _empty_grid())
+    # Static scene carries cuboids/meshes only (voxels go through load_voxel_layers).
+    scene = mgr.build_static_scene()
     assert scene.cuboid is not None and len(scene.cuboid) == 1
+    assert scene.voxel is None or len(scene.voxel) == 0
+    # Voxel layers stay as separate composing grids (no merge into one).
+    grids = mgr.voxel_grids()
+    assert len(grids) == 2
+    assert {g.name for g in grids} == {PICK_BIN_LAYER, PLACE_TRAY_LAYER}
     mgr.clear_voxel_layer(PICK_BIN_LAYER)
+    mgr.clear_voxel_layer(PLACE_TRAY_LAYER)
     mgr.set_static()  # reset so other tests start clean
 
 
@@ -128,22 +138,6 @@ def test_plan_with_box_obstacle_layer_runs(world):
 # ── Multiple ESDF layers must compose (not mask each other) ──
 
 
-def test_voxel_layers_merge_into_one_obstacle(world):
-    adapter, mgr = world
-    box = _box_grid(box_center=(0.5, 0.0, 0.3))
-    mgr.set_voxel_layer(PICK_BIN_LAYER, box)
-    mgr.set_voxel_layer(PLACE_TRAY_LAYER, _empty_grid())  # all free; must NOT mask the box
-    scene = mgr.build_scene()
-    # cuRobo honors only one voxel grid, so the layers are merged into a single grid...
-    assert scene.voxel is not None and len(scene.voxel) == 1
-    merged = scene.voxel[0].feature_tensor.float()
-    # ...and the union (min signed distance) preserves the box's negative interior.
-    assert float(merged.min()) < 0.0
-    assert torch.allclose(merged, box.feature_tensor.float())
-    mgr.clear_voxel_layer(PICK_BIN_LAYER)
-    mgr.clear_voxel_layer(PLACE_TRAY_LAYER)
-
-
 def test_empty_layer_does_not_mask_box_obstacle(world):
     adapter, mgr = world
     # Box centred on the default TCP so the start config is inside the obstacle.
@@ -152,12 +146,53 @@ def test_empty_layer_does_not_mask_box_obstacle(world):
     mgr.set_voxel_layer(PICK_BIN_LAYER, box)
     mgr.set_voxel_layer(PLACE_TRAY_LAYER, _empty_grid())  # committed after the box
     mgr.commit()
-    # With the merge fix the box is enforced (start in collision) -> planning fails.
-    # Before the fix, the empty layer masked the box and this would spuriously succeed.
+    # Both layers are loaded as separate composing grids, so the box is enforced (start in
+    # collision) -> planning fails. Before the native-batch fix the empty layer masked the box
+    # (Scene voxel path = last-one-wins) and this would spuriously succeed.
     result = adapter.plan_free(tcp, max_attempts=1)
     assert not result.success
     mgr.clear_voxel_layer(PICK_BIN_LAYER)
     mgr.clear_voxel_layer(PLACE_TRAY_LAYER)
+    mgr.commit()
+
+
+def test_two_layers_different_poses_both_block(world):
+    adapter, mgr = world
+    # pick_bin and place_tray ESDF grids at DIFFERENT centers (a real cell layout), each
+    # carrying an obstacle on the default-TCP path. Both must be enforced after one commit.
+    tcp = adapter.tcp_pose_at()
+    box = _box_grid(box_center=tuple(tcp.position.tolist()), half=(0.10, 0.10, 0.10))
+    bin_grid = VoxelGrid(
+        name="bin", pose=[*GRID_CENTER, 1.0, 0.0, 0.0, 0.0], dims=list(GRID_DIMS),
+        voxel_size=GRID_VS, feature_tensor=box.feature_tensor.clone(), feature_dtype=torch.float16,
+    )
+    far_center = (GRID_CENTER[0] - 0.6, GRID_CENTER[1] + 0.6, GRID_CENTER[2])
+    tray_grid = VoxelGrid(
+        name="tray", pose=[*far_center, 1.0, 0.0, 0.0, 0.0], dims=list(GRID_DIMS),
+        voxel_size=GRID_VS, feature_tensor=_empty_grid().feature_tensor, feature_dtype=torch.float16,
+    )
+    mgr.set_voxel_layer(PICK_BIN_LAYER, bin_grid)
+    mgr.set_voxel_layer(PLACE_TRAY_LAYER, tray_grid)
+    mgr.commit()
+    # The bin obstacle (at the default TCP) blocks even though the tray grid sits elsewhere.
+    assert not adapter.plan_free(tcp, max_attempts=1).success
+    mgr.clear_voxel_layer(PICK_BIN_LAYER)
+    mgr.clear_voxel_layer(PLACE_TRAY_LAYER)
+    mgr.commit()
+
+
+def test_recommit_layer_updates_world(world):
+    adapter, mgr = world
+    tcp = adapter.tcp_pose_at()
+    # Re-perceive: first an empty bin (free), then an obstacle on the start config.
+    mgr.set_voxel_layer(PICK_BIN_LAYER, _empty_grid())
+    mgr.commit()
+    assert adapter.plan_free(_reachable_goal(adapter, [0.2, -0.2, 0.2]), max_attempts=3).success
+    box = _box_grid(box_center=tuple(tcp.position.tolist()), half=(0.10, 0.10, 0.10))
+    mgr.set_voxel_layer(PICK_BIN_LAYER, box)
+    mgr.commit()
+    assert not adapter.plan_free(tcp, max_attempts=1).success
+    mgr.clear_voxel_layer(PICK_BIN_LAYER)
     mgr.commit()
 
 

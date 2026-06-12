@@ -42,10 +42,12 @@ class FakePlanner:
 
 
 class FakeWorld:
-    def __init__(self, log):
+    def __init__(self, log, tool_geometry=False):
         self.log = log
         self.attached = False
         self.layers = {}
+        self.tool_widths = []  # commanded widths re-attached, in order
+        self._tool_geometry = tool_geometry
 
     def set_voxel_layer(self, name, grid):
         self.layers[name] = grid
@@ -61,6 +63,19 @@ class FakeWorld:
         self.attached = False
         self.log.append(("world.detach",))
 
+    def attach_tool_geometry(self, body):
+        self.tool_widths.append(body.data["width"])
+        self.log.append(("world.attach_tool", body.data["width"]))
+
+
+class FakeTools:
+    """Minimal ToolManager stand-in: builds a parallel-jaw CollisionBody per commanded width."""
+
+    def collision_geom(self, grip, tool_id=None):
+        from motionforge.tools import parallel_jaw_geom_fn
+
+        return parallel_jaw_geom_fn()(grip)
+
 
 def _grasp(reachable=True):
     x = 0.5 if reachable else 999.0
@@ -74,10 +89,13 @@ def _place(reachable=True):
                           GripConfig(width_m=0.08, mode="outward"))
 
 
-def _make_coordinator(picks, places, planner=None, log=None):
+def _make_coordinator(picks, places, planner=None, log=None, joints=None, execution=None):
     log = log if log is not None else []
     gripper = FakeGripper(log)
-    execution = RecordingExecution(log)
+    joints = joints if joints is not None else FakeJointStateSource([0.0] * DOF)
+    # The execution drives the joint-state sink so post-segment verification sees the
+    # achieved config (mirrors the real adapter, which is both executor and joint source).
+    execution = execution if execution is not None else RecordingExecution(log, joint_state=joints)
     world = FakeWorld(log)
     perception = ScriptedPerception(picks, places)
     return (
@@ -88,7 +106,7 @@ def _make_coordinator(picks, places, planner=None, log=None):
             perception=perception,
             gripper=gripper,
             execution=execution,
-            joint_state_source=FakeJointStateSource([0.0] * DOF),
+            joint_state_source=joints,
             config=DEFAULTS,
         ),
         log,
@@ -192,3 +210,89 @@ def test_place_fault_after_recapture_cap():
     assert not result.success
     assert result.state == CoordinatorState.FAULT
     assert "place" in result.fault_reason
+
+
+def test_tool_geometry_reattached_at_three_widths():
+    # With a tool library wired, the gripper geometry is re-attached at standby (pick plan),
+    # grasp width (pre-place), and release width (pre-final-retract), in that order (SPEC §5.4).
+    log = []
+    world = FakeWorld(log)
+    gripper = FakeGripper(log)
+    execution = RecordingExecution(log)
+    picks = [PickPerception([_grasp()], workpiece=object())]  # grasp width 0.02
+    places = [PlacePerception([_place()])]                    # release width 0.08
+    coord = TaskCoordinator(
+        planner=FakePlanner(), world=world, tools=FakeTools(),
+        perception=ScriptedPerception(picks, places), gripper=gripper, execution=execution,
+        joint_state_source=FakeJointStateSource([0.0] * DOF), config=DEFAULTS,
+    )
+    result = coord.run_cycle()
+    assert result.success
+    # standby (config default 0.08), grasp width (0.02), release width (0.08).
+    assert world.tool_widths == [DEFAULTS.gripper_standby_width_m, 0.02, 0.08]
+
+
+def test_tool_geometry_skipped_when_no_tools():
+    # tools=None -> no tool-geometry calls (the default unit path stays GPU-free).
+    log = []
+    picks = [PickPerception([_grasp()], workpiece=object())]
+    places = [PlacePerception([_place()])]
+    coord, _, _, _, world, _ = _make_coordinator(picks, places)  # tools=None
+    coord.run_cycle()
+    assert world.tool_widths == []
+
+
+# -- robustness: empty q0, execution divergence, fault cleanup --
+
+
+def test_empty_q0_faults_without_planning():
+    # An empty joint-state read must FAULT (never silently plan from cuRobo's default config).
+    picks = [PickPerception([_grasp()])]
+    places = [PlacePerception([_place()])]
+    coord, log, *_ = _make_coordinator(picks, places, joints=FakeJointStateSource([]))
+    result = coord.run_cycle()
+    assert not result.success
+    assert result.state == CoordinatorState.FAULT
+    assert "q0" in result.fault_reason
+    assert not any(e[0] == "exec.send" for e in log)  # nothing was streamed
+
+
+def test_execution_divergence_faults_and_stops():
+    # Feedback that diverges from the planned segment end faults the cycle and stops the robot.
+    log = []
+    joints = FakeJointStateSource([0.0] * DOF)
+    execution = RecordingExecution(log, joint_state=joints, drift=0.2)  # 0.2 rad > 0.05 tol
+    picks = [PickPerception([_grasp()], workpiece=object())]
+    places = [PlacePerception([_place()])]
+    coord, log, *_ = _make_coordinator(picks, places, log=log, joints=joints, execution=execution)
+    result = coord.run_cycle()
+    assert not result.success
+    assert result.state == CoordinatorState.FAULT
+    assert "diverged" in result.fault_reason
+    assert any(e[0] == "exec.stop" for e in log)
+
+
+def test_exception_midcycle_cleans_up_attachment():
+    # A planner that raises during PLACE planning (after the pick attach) must still return a
+    # FAULT result (not raise) and detach the held object + stop the robot.
+    class RaiseOnPlace:
+        def __init__(self):
+            self.calls = 0
+
+        def plan_segment(self, goal, constraints, q0=None, axis=None):
+            self.calls += 1
+            if self.calls > 3:  # pick = 3 segments; the 4th call is the place transport
+                raise RuntimeError("planner blew up mid-place")
+            return PlanResult(success=True, trajectory=_traj(q0), metrics={"total_time": 0.02})
+
+    picks = [PickPerception([_grasp()], workpiece=object())]
+    places = [PlacePerception([_place()])]
+    coord, log, _, _, world, _ = _make_coordinator(picks, places, planner=RaiseOnPlace())
+    result = coord.run_cycle()
+    assert not result.success
+    assert result.state == CoordinatorState.FAULT
+    assert "blew up" in result.fault_reason
+    # The workpiece attached during the pick is released; the controller is stopped.
+    assert world.attached is False
+    assert ("world.detach",) in log
+    assert any(e[0] == "exec.stop" for e in log)

@@ -6,6 +6,15 @@ Maintains the cuRobo collision world for a :class:`MotionPlannerAdapter`:
     ``Mapper`` (depth → TSDF → ESDF), composed in one collision query,
   - the attached held-object body on the tool frame.
 
+**Voxel composition (verified).** cuRobo's ``Scene`` voxel path REPLACES rather than composes:
+``update_world(Scene(voxel=[a, b]))`` keeps only the last grid (``load_from_scene_cfg`` →
+``add_obstacle`` → ``load_batch([single])``, which clears the env's voxel set each call). The
+batched ``VoxelData.load_batch([a, b], env)`` DOES compose, loading every grid at its own pose
+and enabling all of them (proven in ``tests/gpu/test_voxel_compose_probe.py``). So static
+bodies go through ``update_world`` while ESDF layers are pushed together via the adapter's
+``load_voxel_layers`` — ROI layers may sit at different cell poses but share dims/voxel_size
+(the cache spec, see :class:`~motionforge.collision.grid_spec.ESDFGridSet`).
+
 torch/curobo are imported lazily so the module stays importable without a GPU.
 """
 
@@ -13,6 +22,7 @@ from __future__ import annotations
 
 from typing import Dict, List, Optional, Sequence, Tuple
 
+from motionforge.collision.grid_spec import ESDFGridSet
 from motionforge.planner.motion_planner import MotionPlannerAdapter
 
 PICK_BIN_LAYER = "pick_bin"
@@ -22,11 +32,18 @@ PLACE_TRAY_LAYER = "place_tray"
 class CollisionWorldManager:
     """Owns scene assembly + ESDF integration + attach/detach for one planner."""
 
-    def __init__(self, adapter: MotionPlannerAdapter) -> None:
+    def __init__(
+        self, adapter: MotionPlannerAdapter, grid_set: Optional[ESDFGridSet] = None
+    ) -> None:
         self._adapter = adapter
+        self._grid_set = grid_set
         self._cuboids: list = []
         self._meshes: list = []
         self._voxel_layers: Dict[str, object] = {}
+
+    @property
+    def grid_set(self) -> Optional[ESDFGridSet]:
+        return self._grid_set
 
     # -- static cell geometry (persistent) --
 
@@ -38,6 +55,8 @@ class CollisionWorldManager:
 
     def set_voxel_layer(self, name: str, grid) -> None:
         """Add/replace a named ESDF ``VoxelGrid`` layer (re-perceived each cycle)."""
+        if self._grid_set is not None:
+            self._grid_set.validate_grid(name, grid)  # fail loudly now, not mid-cycle in cuRobo
         grid.name = name  # ensure a unique, stable name within the scene
         self._voxel_layers[name] = grid
 
@@ -47,14 +66,16 @@ class CollisionWorldManager:
     def layers(self) -> List[str]:
         return list(self._voxel_layers.keys())
 
-    def build_scene(self):
-        """Assemble a cuRobo ``SceneCfg`` from static geometry + voxel layers.
+    def voxel_grids(self) -> List[object]:
+        """The current ESDF layers, in insertion order (one cuRobo ``load_batch``)."""
+        return list(self._voxel_layers.values())
 
-        cuRobo honors only ONE voxel grid per scene — a second ``VoxelGrid`` overwrites the
-        first (the last one wins) rather than composing — so all ESDF layers are merged into a
-        single grid here via :meth:`_merge_voxel_layers`. This restores the SPEC §5.2 intent of
-        composing ``pick_bin`` + ``place_tray`` in one collision query; without it, an all-free
-        layer committed after the bin would mask the bin's obstacles.
+    def build_static_scene(self):
+        """Assemble a cuRobo ``SceneCfg`` from static cuboids/meshes ONLY.
+
+        Voxel layers are intentionally excluded: they are pushed via the adapter's batched
+        ``load_voxel_layers`` because the ``Scene`` voxel path replaces instead of composing
+        (see the module docstring).
         """
         from curobo.scene import Scene  # Scene == SceneCfg
 
@@ -63,49 +84,16 @@ class CollisionWorldManager:
             kwargs["cuboid"] = self._cuboids
         if self._meshes:
             kwargs["mesh"] = self._meshes
-        if self._voxel_layers:
-            kwargs["voxel"] = [self._merge_voxel_layers()]
         return Scene(**kwargs)
 
-    def _merge_voxel_layers(self):
-        """Union all ESDF layers into one ``VoxelGrid`` (element-wise MIN signed distance).
-
-        The union of obstacles is the distance to the nearest surface across all layers, i.e.
-        the per-voxel minimum of the signed distances (negative = inside an obstacle). Layers
-        must share grid geometry (pose/dims/voxel_size); differing grids would need resampling
-        onto a common grid, which is not supported yet.
-        """
-        import numpy as np
-        import torch
-        from curobo._src.geom.types import VoxelGrid
-
-        grids = list(self._voxel_layers.values())
-        if len(grids) == 1:
-            return grids[0]
-
-        base = grids[0]
-        merged = base.feature_tensor.clone()
-        for g in grids[1:]:
-            if (
-                g.feature_tensor.shape != base.feature_tensor.shape
-                or not np.isclose(g.voxel_size, base.voxel_size)
-                or not np.allclose(g.dims, base.dims)
-                or not np.allclose(g.pose, base.pose)
-            ):
-                raise NotImplementedError(
-                    "voxel ESDF layers must share pose/dims/voxel_size to merge; differing "
-                    "grids require resampling onto a common grid (not implemented)"
-                )
-            merged = torch.minimum(merged, g.feature_tensor)
-
-        return VoxelGrid(
-            name="esdf_merged", pose=list(base.pose), dims=list(base.dims),
-            voxel_size=base.voxel_size, feature_tensor=merged, feature_dtype=base.feature_dtype,
-        )
-
     def commit(self) -> None:
-        """Push the assembled scene into the planner's collision world."""
-        self._adapter.update_world(self.build_scene())
+        """Push static geometry then all ESDF layers into the planner's collision world.
+
+        Order matters: ``update_world`` clears the whole env (including voxels), so static
+        bodies are loaded first and the voxel layers are batch-loaded after.
+        """
+        self._adapter.update_world(self.build_static_scene())
+        self._adapter.load_voxel_layers(self.voxel_grids())
 
     # -- native warp ESDF mapper --
 
@@ -179,3 +167,27 @@ class CollisionWorldManager:
     @property
     def attached(self) -> bool:
         return self._adapter.attached_link_name is not None
+
+    # -- gripper collision geometry (width-dependent) --
+
+    def attach_tool_geometry(self, body, num_spheres: Optional[int] = None) -> None:
+        """Attach the gripper's own collision geometry (a width-dependent ``CollisionBody``).
+
+        Converts the TCP-frame primitive into cuRobo ``Cuboid``s and attaches them to the
+        planner's ``tool_collision`` link. Re-call whenever the commanded width changes so the
+        planner always sees the ACTUAL gripper envelope per segment (SPEC §5.4).
+        """
+        from curobo.scene import Cuboid
+
+        from motionforge.tools.tool_manager import collision_body_to_cuboid_specs
+
+        specs = collision_body_to_cuboid_specs(body)
+        cuboids = [Cuboid(name=s["name"], pose=s["pose"], dims=s["dims"]) for s in specs]
+        self._adapter.attach_tool(cuboids, num_spheres=num_spheres)
+
+    def detach_tool_geometry(self) -> None:
+        self._adapter.detach_tool()
+
+    @property
+    def tool_attached(self) -> bool:
+        return self._adapter.tool_attached

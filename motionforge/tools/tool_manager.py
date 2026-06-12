@@ -9,11 +9,42 @@ collision world manager converts those to cuRobo geometry when adding the attach
 
 from __future__ import annotations
 
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from motionforge.geometry import Pose
 from motionforge.geometry import grasp_transform as _grasp_transform
 from motionforge.types import CollisionBody, GripConfig, ToolAction, ToolDescriptor
+
+#: Identity pose list in cuRobo order [x,y,z, qw,qx,qy,qz].
+_IDENTITY = [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]
+
+
+def collision_body_to_cuboid_specs(body: CollisionBody) -> List[dict]:
+    """Flatten a gripper ``CollisionBody`` primitive into TCP-frame cuboid specs.
+
+    Returns ``[{"name", "dims", "pose"}]`` where ``pose`` is ``[x,y,z, qw,qx,qy,qz]`` in the
+    TCP frame (the convention :meth:`MotionPlannerAdapter.attach_tool` expects). Handles the
+    parallel-jaw schema (``base`` + two ``jaws``) and the vacuum schema (a ``cylinder``, taken
+    as its bounding cuboid for the MVP). The held-width dependence comes through the jaw
+    offsets, so the geometry always reflects the COMMANDED width (SPEC §5.4).
+    """
+    if body.kind != "primitive":
+        raise ValueError(f"collision_body_to_cuboid_specs expects kind='primitive', got {body.kind!r}")
+    data = body.data
+    specs: List[dict] = []
+    if "jaws" in data:  # parallel-jaw
+        if "base" in data:
+            b = data["base"]
+            specs.append({"name": "tool_base", "dims": list(b["dims"]), "pose": [*b["offset"], 1.0, 0.0, 0.0, 0.0]})
+        for i, jaw in enumerate(data["jaws"]):
+            specs.append({"name": f"tool_jaw{i}", "dims": list(jaw["dims"]), "pose": [*jaw["offset"], 1.0, 0.0, 0.0, 0.0]})
+    elif "cylinder" in data:  # vacuum: bounding cuboid (2r × 2r × length) along +Z
+        c = data["cylinder"]
+        r, length = float(c["radius"]), float(c["length"])
+        specs.append({"name": "tool_vacuum", "dims": [2 * r, 2 * r, length], "pose": [0.0, 0.0, length / 2.0, 1.0, 0.0, 0.0, 0.0]})
+    else:
+        raise ValueError(f"unrecognized gripper primitive schema: keys={sorted(data)}")
+    return specs
 
 
 class ToolManager:

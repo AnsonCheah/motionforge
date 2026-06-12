@@ -39,6 +39,7 @@ from motionforge.types import GraspCandidate, GripConfig, PlaceCandidate, ToolDe
 DIMS = (1.0, 1.0, 1.0)
 VS = 0.02
 CENTER = (0.5, 0.0, 0.3)
+TCP_OFFSET = Pose([0.0, 0.0, 0.2], [1.0, 0.0, 0.0, 0.0])  # jaw TCP, 0.2 m past tool0 (+Z)
 
 
 def _empty_grid(name="esdf") -> VoxelGrid:
@@ -95,12 +96,13 @@ def plan_cycle(adapter):
         places=[PlacePerception([place], tray_voxels=_empty_grid())],
     )
     tools = ToolManager()
-    tools.register(ToolDescriptor("jaw", Pose([0, 0, 0.2], [1, 0, 0, 0]), parallel_jaw_geom_fn(),
+    tools.register(ToolDescriptor("jaw", TCP_OFFSET, parallel_jaw_geom_fn(),
                                   "socket://gripper", payload_kg=0.5))
+    joints = FakeJointStateSource(adapter.default_q0)
     coord = TaskCoordinator(
         planner=adapter, world=world, tools=tools, perception=perception,
-        gripper=FakeGripper(), execution=RecordingExecution(),
-        joint_state_source=FakeJointStateSource(adapter.default_q0), config=adapter._cfg,
+        gripper=FakeGripper(), execution=RecordingExecution(joint_state=joints),
+        joint_state_source=joints, config=adapter._cfg,
     )
 
     # Wall-clock planning time (execution is fake/instant, so this is ~all planning).
@@ -174,7 +176,8 @@ def main():
         "voxel": {"layers": 2, "dims": list(DIMS), "voxel_size": VS},
     }
     adapter = MotionPlannerAdapter(config=config, collision_cache=collision_cache,
-                                   attached_object_spheres=64)
+                                   attached_object_spheres=64, tcp_offset=TCP_OFFSET,
+                                   tool_spheres=32)
     adapter.warmup()
 
     print("Planning pick-and-place cycle...")

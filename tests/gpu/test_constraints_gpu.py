@@ -9,7 +9,11 @@ torch = pytest.importorskip("torch")
 pytest.importorskip("curobo")
 
 from motionforge.geometry import Pose  # noqa: E402
-from motionforge.planner.constraints import build_tool_pose_criteria  # noqa: E402
+from motionforge.planner.constraints import (  # noqa: E402
+    approach_axis_in_goal_frame,
+    build_tool_pose_criteria,
+    vector_to_principal_axis,
+)
 from motionforge.types import SegmentConstraints  # noqa: E402
 
 pytestmark = [
@@ -75,3 +79,48 @@ def test_linear_approach_criteria_applies_and_plans(mf_planner):
         assert result is not None
     finally:
         mf_planner.reset_tool_pose_criteria()
+
+
+def _max_perp_deviation(planner, traj, line_point, axis_unit, frac=0.5):
+    """Max distance of the path's TCP positions from the line {line_point + t*axis} over the
+    final ``frac`` of the trajectory (where the linear approach should hold)."""
+    a = np.asarray(axis_unit, dtype=float)
+    a = a / np.linalg.norm(a)
+    pts = traj.points
+    start = int(len(pts) * (1.0 - frac))
+    worst = 0.0
+    for i in range(start, len(pts)):
+        p = np.asarray(planner.tcp_pose_at(pts[i][0]).position) - np.asarray(line_point)
+        perp = p - np.dot(p, a) * a
+        worst = max(worst, float(np.linalg.norm(perp)))
+    return worst
+
+
+def test_linear_approach_with_rotated_goal_is_straight(mf_planner):
+    # Find a reachable goal whose tool-+Z approach maps to a base direction that is NOT the
+    # base 'z' axis — the scenario where the goal-frame mapping (vs base-frame) matters.
+    candidates = [
+        [0.2, -0.15, 0.25, 1.2, 1.2],
+        [0.0, -0.1, 0.2, 1.5, 0.0, 1.2],
+        [0.3, 0.0, 0.1, 0.0, 1.4],
+        [0.1, -0.2, 0.3, 1.3, -1.0],
+        [-0.2, -0.1, 0.2, 1.0, 1.0, 1.0],
+    ]
+    goal = approach_base = None
+    for deltas in candidates:
+        g = _reachable_goal(mf_planner, deltas)
+        a = g.rotation_matrix() @ np.array([0.0, 0.0, 1.0])  # tool +Z in base frame
+        # Goal-frame mapping of the approach is always tool +Z = 'z'.
+        assert vector_to_principal_axis(approach_axis_in_goal_frame(a, g.quaternion)) == "z"
+        if vector_to_principal_axis(a) != "z":  # discriminating: base axis differs from goal axis
+            goal, approach_base = g, a
+            break
+    if goal is None:
+        pytest.skip("no discriminating reachable rotated goal found")
+
+    constraints = SegmentConstraints(linear_approach=True, approach_axis=approach_base.tolist())
+    result = mf_planner.plan_segment(goal, constraints, q0=mf_planner.default_q0)
+    assert result.success, "linear approach to the rotated goal failed to plan"
+    # With the goal-frame axis fix the approach holds the line through the goal along tool +Z.
+    dev = _max_perp_deviation(mf_planner, result.trajectory, goal.position, approach_base, frac=0.4)
+    assert dev < 0.05, f"approach deviates {dev:.3f} m from the straight line (axis fix regressed?)"

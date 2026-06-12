@@ -12,7 +12,7 @@ torch = pytest.importorskip("torch")
 pytest.importorskip("curobo")
 
 from curobo._src.geom.types import VoxelGrid  # noqa: E402
-from curobo.scene import Cuboid, Scene  # noqa: E402
+from curobo.scene import Cuboid  # noqa: E402
 
 from motionforge.collision import CollisionWorldManager  # noqa: E402
 from motionforge.coordinator import CoordinatorState, TaskCoordinator  # noqa: E402
@@ -36,11 +36,18 @@ VS = 0.02
 CENTER = (0.5, 0.0, 0.3)
 
 
-def _empty_grid():
+def _empty_grid(center=CENTER):
     n = [round(d / VS) for d in DIMS]
     feat = torch.full(tuple(n), 1.0, dtype=torch.float16, device="cuda:0")
-    return VoxelGrid(name="esdf", pose=[*CENTER, 1, 0, 0, 0], dims=list(DIMS), voxel_size=VS,
+    return VoxelGrid(name="esdf", pose=[*center, 1, 0, 0, 0], dims=list(DIMS), voxel_size=VS,
                      feature_tensor=feat, feature_dtype=torch.float16)
+
+
+# Real cell layout: the bin and the tray are at DIFFERENT base-frame locations. They share
+# dims/voxel_size (the cache spec) but distinct centers — the regression this whole fix exists
+# for (the old merge path required identical grids and would crash here).
+BIN_CENTER = CENTER
+TRAY_CENTER = (CENTER[0] - 0.4, CENTER[1] + 0.4, CENTER[2])
 
 
 @pytest.fixture(scope="module")
@@ -48,7 +55,9 @@ def e2e():
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
     adapter = MotionPlannerAdapter(
-        config=TEST_CONFIG, scene=Scene(voxel=[_empty_grid()]), attached_object_spheres=64
+        config=TEST_CONFIG,
+        collision_cache={"cuboid": 8, "voxel": {"layers": 2, "dims": list(DIMS), "voxel_size": VS}},
+        attached_object_spheres=64, tool_spheres=32,
     )
     adapter.warmup()
     return adapter
@@ -78,14 +87,17 @@ def test_full_pick_and_place_cycle(e2e):
                        dims=[0.04, 0.04, 0.04])
 
     perception = ScriptedPerception(
-        picks=[PickPerception([grasp], bin_voxels=_empty_grid(), workpiece=workpiece)],
-        places=[PlacePerception([place], tray_voxels=_empty_grid())],
+        picks=[PickPerception([grasp], bin_voxels=_empty_grid(BIN_CENTER), workpiece=workpiece)],
+        places=[PlacePerception([place], tray_voxels=_empty_grid(TRAY_CENTER))],
     )
-    execution = RecordingExecution()
+    # Wire the joint-state sink so post-segment execution verification sees the achieved
+    # config (perfect execution: feedback == planned end).
+    joints = FakeJointStateSource(adapter.default_q0)
+    execution = RecordingExecution(joint_state=joints)
     coord = TaskCoordinator(
         planner=adapter, world=world, tools=tools, perception=perception,
         gripper=FakeGripper(), execution=execution,
-        joint_state_source=FakeJointStateSource(adapter.default_q0), config=TEST_CONFIG,
+        joint_state_source=joints, config=TEST_CONFIG,
     )
 
     result = coord.run_cycle()

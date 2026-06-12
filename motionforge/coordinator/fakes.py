@@ -39,18 +39,29 @@ class FakeGripper(GripperActuator):
 
 
 class RecordingExecution(ExecutionAdapter):
-    """Execution adapter that records streamed trajectories and the final q (no socket)."""
+    """Execution adapter that records streamed trajectories and the final q (no socket).
 
-    def __init__(self, log: Optional[list] = None) -> None:
+    Optionally drives a joint-state sink (the coordinator reads feedback from there after each
+    segment for execution verification). ``drift`` adds a per-joint-0 offset to the reported
+    end config to simulate the robot NOT reaching the planned target (divergence → FAULT).
+    """
+
+    def __init__(self, log: Optional[list] = None, joint_state=None, drift: float = 0.0) -> None:
         self.log = log if log is not None else []
         self.sent: List[JointTrajectory] = []
         self._last_q: List[float] = []
+        self._joint_state = joint_state
+        self._drift = drift
 
     def send_trajectory(self, traj: JointTrajectory):
         self.sent.append(traj)
         self.log.append(("exec.send", len(traj)))
         if traj.points:
             self._last_q = list(traj.points[-1][0])
+            if self._drift:
+                self._last_q[0] += self._drift
+            if self._joint_state is not None:
+                self._joint_state.set(self._last_q)
         return {"waypoints": len(traj)}
 
     def read_joint_state(self) -> List[float]:

@@ -25,6 +25,8 @@ class Config:
     recapture_cap: int = 3  # before FAULT
     waypoint_buffer_depth: int = 5  # RAPID look-ahead points
     esdf_voxel_size: float = 0.005  # mapper voxel size (SPEC range 0.005–0.01); tune per part scale
+    #: Post-execution check: max |feedback - planned-end| per joint before FAULT (SPEC §5.7).
+    exec_joint_tol_rad: float = 0.05
 
     # --- segment-builder defaults (not in SPEC §11; overridable) ---
     gripper_standby_width_m: float = 0.08  # open/standby width during approach (must clear neighbors)

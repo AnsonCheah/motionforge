@@ -30,6 +30,8 @@ def test_node_brings_up_with_default_params(ros_context):
         assert node.config.base_frame == "base_link"
         assert node.config.tcp_frame == "tool0"
         assert node.config.recapture_cap == 3
+        # Cell config is an opt-in deployment artifact; empty by default (SPEC §5.8).
+        assert node.get_parameter("cell_config").value == ""
         services = [s for s, _ in node.get_service_names_and_types()]
         assert any(s.endswith("run_cycle") for s in services)
     finally:
